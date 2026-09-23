@@ -9,6 +9,13 @@ Rényi DP（RDP）orders 上累加各次申请的组合消耗，在并发申请�
 决定预留成功或拒绝超预算，并对重复 `request_id` 做**幂等**处理。提供
 预算明细与剩余额度查询。
 
+此外支持两阶段的**预算预留（reservation）**：客户端以
+`reservation_id`、`epsilon`、`delta`、`ttl_seconds` 原子地锁定一段预算；
+同一 `reservation_id` + 同负载重放幂等、负载冲突返回 `409`。预留可在 TTL
+内**确认（confirm）**为一次正式分析申请（沿用同一套 RDP 核算，预算不重复
+扣减），也可随时幂等**释放（release）**；超过 TTL 未确认的预留自动过期、
+在查询与新建预留/申请时不再占用额度。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -86,12 +93,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/datasets/{dataset_id}` | 登记数据集及 epsilon/delta 上限 |
 | `GET` | `/datasets/{dataset_id}` | 数据集信息 + 预算明细 |
-| `GET` | `/datasets/{dataset_id}/budget` | 仅预算明细（消耗 / 剩余 / RDP 曲线） |
+| `GET` | `/datasets/{dataset_id}/budget` | 仅预算明细（消耗 / 预留 / 剩余 / RDP 曲线） |
 | `POST` | `/datasets/{dataset_id}/requests` | 提交分析申请（幂等） |
 | `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected） |
+| `POST` | `/datasets/{dataset_id}/reservations` | 创建预算预留（幂等，带 TTL） |
+| `GET` | `/datasets/{dataset_id}/reservations` | 全部预留记录（含各生命周期状态与时间） |
+| `GET` | `/datasets/{dataset_id}/reservations/{reservation_id}` | 查询单个预留 |
+| `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/confirm` | 确认预留 → 分析申请（幂等） |
+| `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/release` | 释放预留（幂等） |
 | `GET` | `/health` | 健康检查 |
 
-`dataset_id` 允许字母、数字、`.`、`_`、`-`，长度 ≤ 200。
+`dataset_id` / `reservation_id` 允许字母、数字、`.`、`_`、`-`，长度 ≤ 200。
 
 ### 4.1 登记数据集
 
@@ -183,9 +195,11 @@ curl http://localhost:8000/datasets/sales-2026/budget
   "epsilon_cap": 1.0,
   "delta_cap": 1e-6,
   "epsilon_consumed": 0.203936,
+  "epsilon_reserved": 0.0,
   "epsilon_remaining": 0.796064,
   "rdp_best_order": 8192.0,
   "granted_requests": 1,
+  "active_reservations": 0,
   "rdp_curve": {
     "2.0": 18.62, "4.0": 6.34, "8.0": 2.83, "16.0": 1.43,
     "32.0": 0.79, "64.0": 0.50, "128.0": 0.35, "512.0": 0.21,
@@ -193,6 +207,17 @@ curl http://localhost:8000/datasets/sales-2026/budget
   }
 }
 ```
+
+字段口径：
+
+* `epsilon_consumed`：已授权（直接 granted 或由预留 confirmed）分析申请的
+  RDP 投影 epsilon；
+* `epsilon_reserved`：**未过期有效预留**在同一组合曲线上额外锁定的投影
+  epsilon（相对 `epsilon_consumed` 的增量）；
+* `epsilon_remaining`：`epsilon_cap −`（已授权申请与有效预留**一起组合**后
+  的投影 epsilon），即此刻还能再授权的额度；
+* `active_reservations`：处于 `granted`（已创建未确认/释放/过期）状态的
+  预留数量；`rdp_curve` 同时包含已授权申请与有效预留。
 
 ### 4.5 查询申请明细
 
@@ -202,6 +227,122 @@ curl http://localhost:8000/datasets/sales-2026/requests
 
 按受理顺序返回所有申请（granted 与 rejected），每条含申请参数、裁定、
 理由、申请前后累计 epsilon 与时间戳。
+
+### 4.6 创建预算预留
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reservation_id": "res-20260923-0001",
+    "epsilon": 0.2,
+    "delta": 1e-8,
+    "ttl_seconds": 600
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `reservation_id` | string | 必填，客户端生成的幂等键，**同一数据集内唯一** |
+| `epsilon` | float | `> 0`，预留的 epsilon |
+| `delta` | float | `>= 0, < 1`；`0` 表示纯 ε-DP |
+| `ttl_seconds` | int | `1 … 7776000`（最长 90 天），预留有效期；过期未确认自动释放 |
+
+服务在**同一个原子事务**内组合「全部已授权申请 + 全部未过期有效预留 +
+本次预留」后按 RDP 投影判定，返回 `201`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "reservation_id": "res-20260923-0001",
+  "epsilon": 0.2,
+  "delta": 1e-8,
+  "ttl_seconds": 600,
+  "allowed": true,
+  "status": "granted",
+  "reason": null,
+  "epsilon_before": 0.0,
+  "epsilon_after": 0.203936,
+  "epsilon_remaining": 0.796064,
+  "rdp_best_order": 8192.0,
+  "idempotent_replay": false,
+  "created_at": "2026-09-23T01:10:16.563790+00:00",
+  "expires_at": "2026-09-23T01:20:16.563790+00:00",
+  "expired_at": null,
+  "confirmed_at": null,
+  "confirmed_request_id": null,
+  "released_at": null
+}
+```
+
+* 预算内 → `allowed=true, status="granted"`，额度立即锁定，
+  `expires_at = created_at + ttl_seconds`；
+* 超预算 → 仍返回 `201`（正常受理留痕），但 `allowed=false,
+  status="rejected"`，`expires_at=null`，**不锁定任何额度**；
+* 数据集不存在 → `404`。
+
+预留状态机：`granted → confirmed | released | expired`，`rejected` 为终态。
+
+### 4.7 预留幂等与冲突语义
+
+* 相同 `(dataset_id, reservation_id)` + **相同负载**
+  （`epsilon` / `delta` / `ttl_seconds` 全一致）重复提交：返回 `200`、
+  与第一次一致的裁定和时间戳，`idempotent_replay=true`，额度**只锁一次**。
+  注意 TTL **不会**因重放而延长（沿用首次的 `created_at`/`expires_at`）；
+* 相同 `reservation_id` 但 `epsilon` / `delta` / `ttl_seconds` 任一不同：
+  返回 `409 reservation_id_conflict`；
+* 被拒绝的预留同样幂等。
+
+### 4.8 确认预留（转为分析申请）
+
+```bash
+curl -X POST \
+  http://localhost:8000/datasets/sales-2026/reservations/res-20260923-0001/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "req-20260923-0001", "query_type": "gaussian_mean"}'
+```
+
+预留锁定的 `(epsilon, delta)` 变为一条 `granted` 分析申请，`query_type`
+与正式 `request_id` 在确认时给出；响应体与 `POST /requests` 的
+`Verdict` 完全一致（`201`）。
+
+* 预算**不重复扣减**：确认前由预留锁定的组合消耗，确认后改由该申请承载，
+  `epsilon_after` 保持不变；
+* 确认必须在预留处于 `granted` 且未过期时进行；
+  `released` / `expired` / `rejected` → `409`（错误码分别为
+  `reservation_released` / `reservation_expired` /
+  `reservation_rejected`）；预留不存在 → `404 reservation_not_found`；
+* `request_id` 已被其他申请占用（或与同预留上次确认使用的不同）→
+  `409 request_id_conflict` / `reservation_confirmed`，预留保持原状；
+* 相同确认负载重放 → `200`、`idempotent_replay=true`，只生成一条申请。
+
+### 4.9 释放预留
+
+```bash
+curl -X POST \
+  http://localhost:8000/datasets/sales-2026/reservations/res-20260923-0001/release
+```
+
+* 对 `granted` 预留：置为 `released` 并记录 `released_at`，锁定额度
+  **立即释放**，返回 `200`；
+* 重复释放已 `released` / 已 `expired` 的预留：幂等返回最终状态
+  （`idempotent_replay=true`）；
+* `confirmed` / `rejected` 预留不可释放 → `409`；
+  预留不存在 → `404`。
+
+### 4.10 TTL 过期
+
+* 预留不会被后台线程主动删除；任何接触预算的路径（查询预留/预算、新建
+  申请或预留、确认、释放）都会在同一临界区内把 `expires_at ≤ now` 的
+  `granted` 预留惰性标记为 `expired`（记录 `expired_at`），之后它们**不再
+  占用额度**——因此过期后新的申请/预留可以使用这部分额度；
+* 过期是终态：过期预留不能再确认（`409 reservation_expired`），对其调用
+  release 返回幂等结果；
+* `GET …/reservations` 返回全部预留及各自的 `status` 与
+  `created_at` / `expires_at` / `expired_at` / `confirmed_at` /
+  `released_at` 时间戳，便于审计。
 
 ---
 
@@ -224,12 +365,18 @@ curl http://localhost:8000/datasets/sales-2026/requests
                    + (log((α−1)/α) + log((1−δ)/δ)) / (α−1) ]
    ```
 
-4. 准入判定：把**当前累计曲线 + 本次申请**投影后得到 `ε_projected`，
-   当且仅当 `ε_projected ≤ epsilon_cap + EPSILON_TOLERANCE` 时预留成功。
+4. 准入判定：把**当前累计曲线 + 本次申请/预留**投影后得到 `ε_projected`，
+   当且仅当 `ε_projected ≤ epsilon_cap + EPSILON_TOLERANCE` 时授权/锁定。
+   这里的「当前累计曲线」= 全部 `granted` 申请 ∪ 全部**未过期**
+   `granted` 预留；已释放/已过期预留不参与组合。
+
+5. 确认（confirm）只是把同一条 `(ε, δ)` 从「预留集合」移到「已授权申请
+   集合」：确认前后的组合曲线完全相同，因此不发生二次扣减；释放与过期
+   则从组合中移除该条预留，额度立即/自动归还。
 
 特殊情形：
 
-* 全部已授权申请都是纯 ε-DP 时，直接采用精确的基本组合
+* 全部已授权申请与有效预留都是纯 ε-DP 时，直接采用精确的基本组合
   `ε_total = Σ ε_i`，不收取 RDP 转换的保守余量；
 * 纯 DP 与近似 DP 混合时，纯 ε 之和作为常数偏移叠加到 RDP 曲线上再统一
   转换。
@@ -243,19 +390,40 @@ curl http://localhost:8000/datasets/sales-2026/requests
 
 ## 6. 并发与原子性
 
-* 每个写操作（登记、提交申请）在进程内 `asyncio.Lock` 保护下打开一个
-  SQLite **`BEGIN IMMEDIATE`** 事务：「查重 → 重算组合消耗 → 判定 →
-  插入记录」在同一个事务临界区内完成，并发申请被串行化，
-  **不可能出现两个申请同时看到同一旧余额而双双超支**；
+* 每个写操作（登记、提交申请、创建/确认/释放预留）在进程内
+  `asyncio.Lock` 保护下打开一个 SQLite **`BEGIN IMMEDIATE`** 事务：
+  「惰性过期清理 → 查重/查状态 → 重算（已授权申请 + 有效预留）组合消耗 →
+  判定 → 插入/更新记录」在同一个事务临界区内完成，并发操作被串行化，
+  **申请与预留无论怎样并发交错，已授权 + 有效预留的组合消耗都不会超过
+  cap**；
+* 预留的确认同样在该临界区内完成「插入 granted 申请 + 预留置
+  confirmed」，两步原子，预算不可能被扣两次；
 * SQLite 启用 **WAL** 与 `busy_timeout`：读不阻塞写，写冲突排队等待
-  而非立即报错；`(dataset_id, request_id)` 上有 `UNIQUE` 约束作为最终
-  防线；
-* 拒绝不写入任何消耗，只留一条 `rejected` 记录，因此并发申请人中
-  “先到先得、额满即拒”。
+  而非立即报错；`(dataset_id, request_id)` 与 `(dataset_id,
+  reservation_id)` 上各有 `UNIQUE` 约束作为最终防线；
+* 拒绝不写入任何消耗，只留一条 `rejected` 记录，因此并发请求/预留中
+  “先到先得、额满即拒”；
+* TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
+  `expired` 再计算额度，因此过期预留既不会继续占额，也不会被重复确认。
 
 ---
 
-## 7. 运行测试
+## 7. 数据库迁移
+
+Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序执行
+待应用的迁移脚本（幂等 DDL，包在一个事务里），**无需人工干预**：
+
+| 版本 | 内容 |
+| --- | --- |
+| 1 | `datasets`、`requests` 表（原始版本） |
+| 2 | 新增 `reservations` 表（含状态、TTL、`expires_at` / `expired_at` / `confirmed_at` / `released_at` 等时间列与部分索引） |
+
+旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再升级
+到 v2，已有数据集与申请记录原样保留。
+
+---
+
+## 8. 运行测试
 
 ```bash
 pip install -r requirements-dev.txt
@@ -267,9 +435,15 @@ RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409�
 数据集 404，以及 60 路并发申请不超预算、20 路重复 `request_id` 并发仅
 一条被创建。
 
+预留相关测试另覆盖：预留锁定/拒绝、预算视图、创建幂等与三种负载冲突
+409、确认转申请且不双重扣减、确认幂等/冲突/终态 409、释放幂等与终态
+409、TTL 过期在查询与新建时释放额度、60 路并发预留不超预算、15 路并发
+确认仅一条申请、预留/确认/释放/直接申请混合并发下始终不超 cap，以及
+从 v1 schema 启动时的自动迁移。
+
 ---
 
-## 8. 项目结构
+## 9. 项目结构
 
 ```
 .

@@ -10,6 +10,13 @@ Concurrency model
   insert therefore happen in one serialised, atomic critical section.
 * Each event-loop task gets its own aiosqlite connection; nothing is shared
   across threads.
+
+Schema migrations
+-----------------
+A ``PRAGMA user_version`` integer selects the next migration to apply.
+Each migration is an idempotent DDL script wrapped in one transaction, so
+both fresh databases and old ledgers created before reservations existed
+arrive at the latest schema on startup.
 """
 from __future__ import annotations
 
@@ -21,7 +28,9 @@ import aiosqlite
 
 from .config import settings
 
-SCHEMA = """
+# ----------------------------------------------------------------- schema --
+
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS datasets (
     dataset_id    TEXT PRIMARY KEY,
     epsilon_cap   REAL NOT NULL,
@@ -49,6 +58,53 @@ CREATE TABLE IF NOT EXISTS requests (
 CREATE INDEX IF NOT EXISTS idx_requests_dataset ON requests (dataset_id, id);
 """
 
+# Version 2: budget reservations.  A reservation locks epsilon/delta budget
+# until expires_at; "granted" rows are the only ones that occupy budget, and
+# only while now < expires_at.  Confirmation turns a granted reservation into
+# a regular granted analysis request in ``requests``; release / expiry free
+# the locked budget again.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS reservations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id      TEXT NOT NULL REFERENCES datasets(dataset_id),
+    reservation_id  TEXT NOT NULL,
+    epsilon         REAL NOT NULL,
+    delta           REAL NOT NULL,
+    ttl_seconds     INTEGER NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN (
+                        'granted', 'rejected', 'confirmed', 'released',
+                        'expired'
+                    )),
+    reason          TEXT,
+    epsilon_before  REAL NOT NULL,
+    epsilon_after   REAL NOT NULL,
+    rdp_best_order  REAL NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT,
+    expired_at      TEXT,
+    confirmed_at    TEXT,
+    confirmed_request_id TEXT,
+    released_at     TEXT,
+    UNIQUE (dataset_id, reservation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_dataset
+    ON reservations (dataset_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_active
+    ON reservations (dataset_id)
+    WHERE status = 'granted';
+"""
+
+MIGRATIONS: dict[int, str] = {
+    1: SCHEMA_V1,
+    2: SCHEMA_V2,
+}
+LATEST_VERSION = max(MIGRATIONS)
+
+
+# --------------------------------------------------------------- exceptions --
+
 
 class DatasetExists(Exception):
     """Raised when registering a dataset_id that is already present."""
@@ -60,6 +116,24 @@ class DatasetNotFound(Exception):
 
 class RequestConflict(Exception):
     """Same request_id reused with a different payload (HTTP 409)."""
+
+
+class ReservationConflict(Exception):
+    """Same reservation_id reused with a different payload (HTTP 409)."""
+
+
+class ReservationNotFound(Exception):
+    """Raised when a reservation_id is missing (HTTP 404)."""
+
+
+class ReservationStateConflict(Exception):
+    """Operation incompatible with the reservation lifecycle state (HTTP 409).
+
+    ``args[0]`` carries an API error code, ``args[1]`` the human detail.
+    """
+
+
+# -------------------------------------------------------------- connection --
 
 
 @asynccontextmanager
@@ -78,8 +152,21 @@ async def init_db() -> None:
         await db.execute(f"PRAGMA busy_timeout = {int(settings.busy_timeout_ms)}")
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA foreign_keys = ON")
-        await db.executescript(SCHEMA)
-        await db.commit()
+        await _migrate(db)
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    async with db.execute("PRAGMA user_version") as cur:
+        row = await cur.fetchone()
+    version = int(row[0])
+    while version < LATEST_VERSION:
+        next_version = version + 1
+        await db.executescript(MIGRATIONS[next_version])
+        # PRAGMA user_version accepts only an integer literal, and next_version
+        # is an internal constant, never user input.
+        await db.execute(f"PRAGMA user_version = {next_version}")
+        version = next_version
+    await db.commit()
 
 
 @asynccontextmanager
@@ -88,6 +175,9 @@ async def connect() -> AsyncIterator[aiosqlite.Connection]:
     conn = aiosqlite.connect(settings.db_path)
     async with conn as c:
         c.row_factory = aiosqlite.Row
+        # Read endpoints may perform the lazy reservation-expiry UPDATE, which
+        # needs the same write-lock queueing guarantee as explicit writers.
+        await c.execute(f"PRAGMA busy_timeout = {int(settings.busy_timeout_ms)}")
         yield c
 
 
@@ -140,6 +230,14 @@ async def require_dataset(db: aiosqlite.Connection, dataset_id: str) -> aiosqlit
 # ---------------------------------------------------------------- requests --
 
 
+_RESERVATION_SELECT = (
+    "SELECT dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
+    "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
+    "expires_at, expired_at, confirmed_at, confirmed_request_id, released_at "
+    "FROM reservations WHERE dataset_id = ?"
+)
+
+
 async def list_granted_entries(
     db: aiosqlite.Connection, dataset_id: str
 ) -> list[tuple[float, float]]:
@@ -151,6 +249,42 @@ async def list_granted_entries(
     ) as cur:
         rows = await cur.fetchall()
     return [(row[0], row[1]) for row in rows]
+
+
+async def list_active_reservation_entries(
+    db: aiosqlite.Connection, dataset_id: str, *, now_iso: str
+) -> list[tuple[float, float]]:
+    """``(epsilon, delta)`` pairs of non-expired granted reservations.
+
+    Rows whose ``expires_at`` has passed are lazily marked expired first, so
+    they stop occupying budget for queries and new admissions alike.
+    """
+    await db.execute(
+        "UPDATE reservations SET status = 'expired', expired_at = ? "
+        "WHERE dataset_id = ? AND status = 'granted' AND expires_at <= ?",
+        (now_iso, dataset_id, now_iso),
+    )
+    async with db.execute(
+        "SELECT epsilon, delta FROM reservations "
+        "WHERE dataset_id = ? AND status = 'granted' "
+        "AND (expires_at IS NULL OR expires_at > ?) ORDER BY id",
+        (dataset_id, now_iso),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
+async def count_active_reservations(
+    db: aiosqlite.Connection, dataset_id: str, *, now_iso: str
+) -> int:
+    async with db.execute(
+        "SELECT COUNT(*) FROM reservations "
+        "WHERE dataset_id = ? AND status = 'granted' "
+        "AND (expires_at IS NULL OR expires_at > ?)",
+        (dataset_id, now_iso),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0])
 
 
 async def insert_request(
@@ -200,3 +334,122 @@ async def list_requests(db: aiosqlite.Connection, dataset_id: str) -> list[aiosq
         (dataset_id,),
     ) as cur:
         return await cur.fetchall()
+
+
+# ------------------------------------------------------------- reservations --
+
+
+async def insert_reservation(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    epsilon: float,
+    delta: float,
+    ttl_seconds: int,
+    status: str,
+    reason: Optional[str],
+    epsilon_before: float,
+    epsilon_after: float,
+    rdp_best_order: float,
+    created_at: str,
+    expires_at: Optional[str],
+) -> None:
+    await db.execute(
+        "INSERT INTO reservations "
+        "(dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
+        "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
+        "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id, reservation_id, epsilon, delta, ttl_seconds, status,
+            reason, epsilon_before, epsilon_after, rdp_best_order, created_at,
+            expires_at,
+        ),
+    )
+
+
+async def get_reservation(
+    db: aiosqlite.Connection, dataset_id: str, reservation_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(
+        f"{_RESERVATION_SELECT} AND reservation_id = ?",
+        (dataset_id, reservation_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def list_reservations(
+    db: aiosqlite.Connection, dataset_id: str
+) -> list[aiosqlite.Row]:
+    async with db.execute(
+        f"{_RESERVATION_SELECT} ORDER BY id",
+        (dataset_id,),
+    ) as cur:
+        return await cur.fetchall()
+
+
+async def expire_reservation(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    expired_at: str,
+) -> None:
+    """Lazily mark an outstanding granted reservation as expired."""
+    await db.execute(
+        "UPDATE reservations SET status = 'expired', expired_at = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (expired_at, dataset_id, reservation_id),
+    )
+
+
+async def confirm_reservation(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    confirmed_request_id: str,
+    confirmed_at: str,
+    epsilon_before: float,
+    epsilon_after: float,
+    rdp_best_order: float,
+) -> None:
+    await db.execute(
+        "UPDATE reservations SET status = 'confirmed', confirmed_at = ?, "
+        "confirmed_request_id = ?, epsilon_before = ?, epsilon_after = ?, "
+        "rdp_best_order = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (
+            confirmed_at, confirmed_request_id, epsilon_before, epsilon_after,
+            rdp_best_order, dataset_id, reservation_id,
+        ),
+    )
+
+
+async def release_reservation(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    released_at: str,
+) -> None:
+    await db.execute(
+        "UPDATE reservations SET status = 'released', released_at = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (released_at, dataset_id, reservation_id),
+    )
+
+
+async def backdate_reservation_expiry(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    expires_at: str,
+) -> None:
+    """Test/admin helper: rewrite a reservation's expiry instant."""
+    await db.execute(
+        "UPDATE reservations SET expires_at = ? "
+        "WHERE dataset_id = ? AND reservation_id = ?",
+        (expires_at, dataset_id, reservation_id),
+    )
